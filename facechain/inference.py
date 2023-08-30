@@ -505,7 +505,7 @@ def compress_image(input_path, target_size):
         f.write(compressed_image)
 
     # 删除原文件
-    os.remove(input_path)
+    # os.remove(input_path)
     return output_path
 
 
