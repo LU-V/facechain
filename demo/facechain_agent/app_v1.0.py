@@ -22,6 +22,8 @@ from modelscope.utils.config import Config
 import uuid
 import dashscope
 from dashscope.audio.tts import SpeechSynthesizer
+from dashscope.audio.asr import Recognition
+import subprocess
 
 PROMPT_START = "你好，我是FaceChainAgent，可以帮你生成写真照片。请告诉我你需要的风格的名字。"
 
@@ -37,7 +39,7 @@ INSTRUCTION_TEMPLATE = """【多轮对话历史】
 
 <|startofexec|>```JSON\n{"result": {"name": "style_search_tool", "value": "赛博朋克(Cybernetics punk)", file_path: "../../styles/leosamsMoonfilm_filmGrain20/Cybernetics_punk.json"}}\n```<|endofexec|>
 
-我已为你找到的风格类型名字是赛博朋克(Cybernetics punk)。
+我已为你找到的风格类型名字是赛博朋克(Cybernetics punk)。下面是该风格的预览图。
 
 现在我需要你提供1-3张照片，请点击图片上传按钮上传你的照片。上传完毕后在对话框里告诉我你已经上传好照片了。\n\n</s>
 
@@ -62,9 +64,9 @@ INSTRUCTION_TEMPLATE1 = """
 <|user|>: 我想要换个古风风格。
 
 <|assistant|>: 好的，我将首先搜索相关风格，然后再为您生成古风风格的写真
-<|startofthink|>```JSON\n{\n   "api_name": "style_search_tool",\n    "parameters": {\n      "text": "换一个古风的吧"\n   }\n}\n```<|endofthink|>
+<|startofthink|>```JSON\n{\n   "api_name": "style_search_tool",\n    "parameters": {\n      "text": "我想要换个古风风格"\n   }\n}\n```<|endofthink|>
 
-我为你搜索到的风格是古风风格(Old style)。
+我为你搜索到的风格是古风风格(Old style)。下面是该风格的预览图。
 我现在将用前面你上传的照片和新选择的风格生成写真照。
 生成写真照中：
 <|startofthink|>```JSON\n{\n   "api_name": "facechain_inference_tool",\n    "parameters": {\n   "matched_style_file_path": "../../styles/leosamsMoonfilm_filmGrain20/Old_style.json"\n  }\n}\n```<|endofthink|>
@@ -83,9 +85,6 @@ os.environ['TOOL_CONFIG_FILE'] = '../config/cfg_tool_template.json'
 os.environ['MODEL_CONFIG_FILE'] = '../config/cfg_model_template.json'
 os.environ['OUTPUT_FILE_DIRECTORY'] = './tmp'
 dashscope.api_key = os.environ.get('DASHSCOPE_API_KEY')
-dashscope.base_http_api_url = "xxxxxxxx"
-dashscope.base_websocket_api_url = 'xxxxxxxxxx'
-
 style_paths = ["../../styles/leosamsMoonfilm_filmGrain20", "../../styles/MajicmixRealistic_v6"]
 styles = []
 for folder_path in style_paths:
@@ -113,13 +112,6 @@ model_cfg = Config.from_file(model_cfg_file)
 model_name = 'http_llm'
 llm = LLMFactory.build_llm(model_name, model_cfg)
 
-prompt_generator = MSPromptGenerator(
-    system_template=SYSTEM_PROMPT,
-    instruction_template=INSTRUCTION_TEMPLATE)
-
-prompt_generator1 = MSPromptGenerator(
-    system_template=SYSTEM_PROMPT,
-    instruction_template=INSTRUCTION_TEMPLATE1)
 
 def add_file(history, files, uuid_str: str):
     if not uuid_str:
@@ -159,6 +151,52 @@ def add_file(history, files, uuid_str: str):
 def reset_user_input():
     return gr.update(value="")
 
+#audio转wav
+def _preprocess(filename):
+    audio_name = 'audio.wav'
+    subprocess.call(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            filename,
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-loglevel",
+            "quiet",
+            audio_name,
+        ]
+    )
+    return audio_name
+#asr初始化
+recognition = Recognition(model='paraformer-realtime-v1',
+                          format='wav',
+                          sample_rate=16000,
+                          callback=None)
+
+def transcribe(microphone):
+    file = microphone
+    print(f"\n\nFile is: {file}\n\n")
+    print("Starting Preprocessing")
+    _preprocess(filename=file)
+
+def process_audio(audio):
+    #gradio 3.29没有stop_recording事件，用change事件，会有None
+    if audio is None:
+        return " "
+    else:
+        transcribe(audio)
+        result = recognition.call("audio.wav")
+        res = ''
+        for sentence in result.get_sentence():
+            res +=str(sentence)
+        res=eval(res)
+        print(res['text'])
+        return res['text']
 
 def text_to_speech(text):
     result = SpeechSynthesizer.call(model='sambert-zhichu-v1',
@@ -166,21 +204,21 @@ def text_to_speech(text):
                                     sample_rate=48000,
                                     format='wav')
     return result.get_audio_data()
+    
 
-    if result.get_audio_data() is not None:
-        with open('tts.wav', 'wb') as f:
-            f.write(result.get_audio_data())
+    
 
 
 def init(uuid_str, state):
+    uuid_str=uuid_str[:8]
     if not uuid_str:
         if os.getenv("MODELSCOPE_ENVIRONMENT") == 'studio':
             raise gr.Error("请登陆后使用! (Please login first)")
         else:
             uuid_str = 'facechain_agent'
-    #print('##############################', uuid_str)
-    uuid_str=uuid_str[:8]
-    #print("#####切割后uuid_str",uuid_str)
+    wav_dir = f"./{uuid_str}/wav"
+    shutil.rmtree(wav_dir, ignore_errors=True)
+    os.makedirs(wav_dir, exist_ok=True)
     style_search_tool = StyleSearchTool(style_paths)
     facechain_finetune_tool = FaceChainFineTuneTool(uuid_str)  # 初始化lora_name,区分不同用户
     facechain_inference_tool = FaceChainInferenceTool(uuid_str)
@@ -189,6 +227,13 @@ def init(uuid_str, state):
         facechain_finetune_tool.name: facechain_finetune_tool,
         facechain_inference_tool.name: facechain_inference_tool
     }
+    prompt_generator = MSPromptGenerator(
+        system_template=SYSTEM_PROMPT,
+        instruction_template=INSTRUCTION_TEMPLATE)
+
+    prompt_generator_only_gen = MSPromptGenerator(
+        system_template=SYSTEM_PROMPT,
+        instruction_template=INSTRUCTION_TEMPLATE1)
     agent = AgentExecutor(
         llm,
         tool_cfg,
@@ -197,9 +242,19 @@ def init(uuid_str, state):
         additional_tool_list=additional_tool_list,
         # knowledge_retrieval=knowledge_retrieval
     )
+    agent_only_gen = AgentExecutor(
+        llm,
+        tool_cfg,
+        prompt_generator=prompt_generator_only_gen,
+        tool_retrieval=False,
+        additional_tool_list=additional_tool_list,
+        # knowledge_retrieval=knowledge_retrieval
+    )
     agent.set_available_tools(additional_tool_list.keys())
+    agent_only_gen.set_available_tools(additional_tool_list.keys())
     state['agent'] = agent
-    state['additional_tool_list'] = additional_tool_list
+    state['agent_only_gen'] = agent_only_gen
+    state['wav_dir'] = wav_dir
 
 
 with gr.Blocks(css=MAIN_CSS_CODE, theme=gr.themes.Soft()) as demo:
@@ -210,20 +265,15 @@ with gr.Blocks(css=MAIN_CSS_CODE, theme=gr.themes.Soft()) as demo:
 
     with gr.Row():
         gr.Markdown(
-            "# <center> \N{fire} FaceChain Potrait Generation ([Github star it here](https://github.com/modelscope/facechain/tree/main) \N{whale},   [Paper cite it here](https://arxiv.org/abs/2308.14256) \N{whale})</center>")
+            "# <center> \N{fire} FaceChain Potrait Generation ([Github star facechain here](https://github.com/modelscope/facechain/tree/main) \N{whale}, [Github star modelscope_agent here](https://github.com/modelscope/modelscope-agent) \N{whale}, [Paper cite facechain here](https://arxiv.org/abs/2308.14256) \N{whale},  [Paper cite modelscope_agent here](https://arxiv.org/abs/2309.00986) \N{whale})</center>")
     with gr.Row():   
         gr.Markdown(
             "##### <center> 本项目仅供学习交流，请勿将模型及其制作内容用于非法活动或违反他人隐私的场景。(This project is intended solely for the purpose of technological discussion, and should not be used for illegal activities and violating privacy of individuals.)</center>")
     with gr.Row():
-        gr.Markdown(
-            """ <img src=https://gw.alicdn.com/imgextra/i1/O1CN01y1wvKm1HdHow9Gx1Y_!!6000000000780-0-tps-1800-654.jpg>""")
-    with gr.Row():
         with gr.Column():
             gr.Markdown(""" 🌈 🌈 🌈
 
-                        ## 你好，我是FaceChain Agent，可以帮你生成写真照片。
-
-                        ## 下图是各类风格的展示图，你可以在这先挑选你喜欢的风格。
+                        ## 你好，我是FaceChain Agent，可以帮你生成写真照片。下面是各类风格的展示图，你可以在这先挑选你喜欢的风格。
 
                         ## 然后在下方的聊天框里与我交流吧，一起来生成美妙的写真照！
 
@@ -257,13 +307,16 @@ with gr.Blocks(css=MAIN_CSS_CODE, theme=gr.themes.Soft()) as demo:
                 with gr.Column(min_width=110, scale=1):
                     regenerate_button = gr.Button(
                         "重新生成", elem_id='regenerate_button')
+            with gr.Row(elem_id="chat-bottom-container"):
+                with gr.Column(scale=12):
+                    audio = gr.Audio(source='microphone',type="filepath",label='语音输入')
             gr.Examples(
-                examples=['我想要牛仔风', '我想要凤冠霞帔风', '我的照片上传好了', '我现在想换个风格，我想要工作风'],
+                examples=['我想要牛仔风', '我想要凤冠霞帔风', '我的照片上传好了', '我想换成工作风'],
                 inputs=[user_input],
                 label="示例",
                 elem_id="chat-examples")
 
-
+    
     def facechain_agent(*inputs):
 
         user_input = inputs[0]
@@ -277,66 +330,145 @@ with gr.Blocks(css=MAIN_CSS_CODE, theme=gr.themes.Soft()) as demo:
 
         def update_component(exec_result, history):
             exec_result = exec_result['result']
-            name = exec_result.pop('name')
+            name = exec_result.get('name')
             if name == 'facechain_inference_tool':
                 single_path = exec_result['single_path']
-                #print("########_______single_path", single_path)
-
                 image_files = glob.glob(os.path.join(single_path, '*.jpg'))
                 image_files += glob.glob(os.path.join(single_path, '*.png'))
-                #print("########_______image_files", image_files)
-
                 history = [(None, (file,)) for file in image_files]
-                # task_history  = task_history + [(None,(file,)) for file in image_files]
             else:
                 history = []
-                # task_history  = task_history
+            return history
+
+        def preview_image(exec_result, history):
+            print("####################### exec_result", exec_result)
+            exec_result = exec_result['result']
+            name = exec_result['name']
+            if name == 'style_search_tool':
+                preview_image_path = exec_result['file_path']
+                with open(preview_image_path, "r") as f:
+                    data = json.load(f)
+                preview_image = os.path.join("../../",data["img"])
+                history = [(None,(preview_image,))]
+                
+            else:
+                history = [] 
             return history
 
         response = ''
+        i = 0 #i,j,m控制语音输出逻辑
+        j = 0
+        k = -1 #k控制文本输出位置
+        m = 0
         for frame in agent.stream_run(user_input + KEY_TEMPLATE, remote=True):
+            global l
             is_final = frame.get("frame_is_final")
             llm_result = frame.get("llm_text", "")
             exec_result = frame.get('exec_result', '')
-            # print(frame)
             history = []
+            
             llm_result = llm_result.split("<|user|>")[0].strip()
             if len(exec_result) != 0:
+                preview_image_history = preview_image(exec_result, chatbot)
                 history = update_component(exec_result, chatbot)
-                print("#########________history", history)
                 frame_text = " "
             else:
                 # action_exec_result
                 frame_text = llm_result
                 response = f'{response}\n{frame_text}'
-                chatbot[-1] = (user_input, response)
+                
+                chatbot[k] = (user_input, response)
             if history != []:
                 history_image = history
-
+            # if preview_image_history != []:
+            #     pre_image = preview_image_history
             yield chatbot
+            print(response)
+            wav_dir = state['wav_dir']
+            if i == 0:
+                index1 = response.find("<|startofthink|>")
+                text1 = response[:index1]
+                data = text_to_speech(text1)
+                with open(f'{wav_dir}/text1.wav', 'wb') as f:
+                    f.write(data)
+                chatbot.append((None,(f'{wav_dir}/text1.wav',)))
+                i = 1
+                k -= 1
+                yield chatbot
+            
+            if j == 0: 
+                index2 = response.find("<|endofthink|>")
+                text2 = response[index2:].replace("<|endofthink|>"," ",1)
+                if text2 != " ":
+                    index3 = text2.find("<|startofthink|>")
+                    index4 = text2.find("<|endofthink|>")
+                    text4 = text2[index4:].replace("<|endofthink|>"," ")
+                    if index3 != -1:
+                        if text4 == " " and m == 0:
+                            text3 = text2[:index3]
+                            data = text_to_speech(text3)
+                            with open(f'{wav_dir}/text3.wav', 'wb') as f:
+                                f.write(data)
+                            chatbot.append((None,(f'{wav_dir}/text3.wav',)))
+                            k -= 1
+                            yield chatbot
+                            m = 1
+                            try:
+                                if preview_image_history !=[]:
+                                    for item in preview_image_history:
+                                        chatbot.append(item)
+                                        yield chatbot
+                                        k -= 1
+                                    preview_image_history = []
+                            except:
+                                pass 
+                            
+                        if text4 != " ":
+                            data = text_to_speech(text4)
+                            with open(f'{wav_dir}/text4.wav', 'wb') as f:
+                                f.write(data)
+                            chatbot.append((None,(f'{wav_dir}/text4.wav',)))
+                            k -= 1
+                            yield chatbot
+                            j =1  
+                    else:
+                        data = text_to_speech(text2)
+                        with open(f'{wav_dir}/text2.wav', 'wb') as f:
+                                f.write(data)
+                        chatbot.append((None,(f'{wav_dir}/text2.wav',)))
+                        k -= 1
+                        j =1
+                        yield chatbot 
+                        try:
+                            if preview_image_history !=[]:
+                                for item in preview_image_history:
+                                    chatbot.append(item)
+                                    yield chatbot
+                                    k -= 1
+                                preview_image_history = []
+                        except:
+                            pass  
+                else:
+                    pass 
+                      
+        
         try:
             if history_image != []:
+                # make sure gen only for agent
+
                 try:
-                    agent = AgentExecutor(
-                        llm,
-                        tool_cfg,
-                        prompt_generator=prompt_generator1,
-                        tool_retrieval=False,
-                        additional_tool_list=state["additional_tool_list"],
-                        # knowledge_retrieval=knowledge_retrieval
-                    )
-                    agent.set_available_tools(state["additional_tool_list"].keys())
-                    inputs[2]['agent'] = agent
+                    inputs[2]['agent'] = state['agent_only_gen']
                 except Exception as e:
                     import traceback
                     print(f'error {e} with detail {traceback.format_exc()}')
-
+                    
                 for item in history_image:
                     chatbot.append(item)
                     yield chatbot
 
         except:
             pass
+           
 
 
     # ---------- 事件 ---------------------
@@ -379,7 +511,7 @@ with gr.Blocks(css=MAIN_CSS_CODE, theme=gr.themes.Soft()) as demo:
     clear_session_button.click(
         fn=lambda: clean_outputs_start, inputs=[], outputs=clean_outputs_target)
     upload_button.upload(add_file, inputs=[chatbot, upload_button, uuid_str], outputs=[chatbot], show_progress=True)
-    # chatbot[-1] = ((None, PROMPT_START))
+    audio.change(process_audio,inputs=[audio],outputs=[user_input])
 demo.title = "Facechian Agent 🎁"
 if __name__ == "__main__":
     # print(multiprocessing.get_start_method())
